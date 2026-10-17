@@ -1,0 +1,23 @@
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Large media files
+*.mp4
+*.avi
+*.mkv
+
+# Reference folders
+subzhub/

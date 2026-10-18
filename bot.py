@@ -500,9 +500,6 @@ async def slash_spamraid(
     delay: Optional[float] = 0.0,
     amount: Optional[int] = None
 ):
-    if not await enforce_server_tag(interaction):
-        return
-
     delay = max(MIN_DELAY_SECONDS, float(delay if delay is not None else 0.0))
     delay_str = f"{delay:g}s" if delay > 0 else "0s"
 
@@ -591,9 +588,6 @@ async def slash_embedspam(
     image_url: Optional[str] = None,
     thumbnail_url: Optional[str] = None
 ):
-    if not await enforce_server_tag(interaction):
-        return
-
     delay = max(MIN_DELAY_SECONDS, float(delay if delay is not None else 0.0))
     delay_str = f"{delay:g}s" if delay > 0 else "0s"
 
@@ -687,9 +681,6 @@ async def slash_say(
     interaction: discord.Interaction,
     message: str
 ):
-    if not await enforce_server_tag(interaction):
-        return
-
     # Ephemeral immediate response
     await interaction.response.send_message("💬 Sending...", ephemeral=True)
 
@@ -728,9 +719,6 @@ async def slash_say(
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def slash_stop(interaction: discord.Interaction):
-    if not await enforce_server_tag(interaction):
-        return
-
     session_key = interaction.channel_id or interaction.user.id
     running_tasks = [t for t in list(active_tasks.get(session_key, set())) if not t.done()]
 

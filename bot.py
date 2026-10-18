@@ -26,13 +26,15 @@ ALLOWED_GUILD_ID = int(os.getenv("ALLOWED_GUILD_ID", "1360158665230782614"))
 ALLOWED_TAG_NAME = os.getenv("ALLOWED_TAG_NAME", "XERO").strip().upper()
 
 intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
 
 # Track active repeater tasks per channel or user session to allow stacking and /stop
 active_tasks: Dict[int, Set[asyncio.Task]] = defaultdict(set)
 
 # Short TTL cache to make tag checks instantaneous while avoiding Discord REST rate limits
 user_tag_cache: Dict[int, Tuple[bool, float, str]] = {}
-CACHE_TTL = 30.0  # seconds
+CACHE_TTL = 120.0  # seconds — long TTL to avoid REST round-trips on Railway
 
 MAX_MESSAGE_COUNT = 1000
 MIN_DELAY_SECONDS = 0.0
@@ -69,7 +71,37 @@ class RepeaterBot(commands.Bot):
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
-        logger.info(f"Bot is ready! User Install Link: https://discord.com/oauth2/authorize?client_id={self.user.id}")
+        # Non-admin permissions: View Channels, Send Messages, Embed Links, Attach Files, Read History, Send in Threads
+        guild_invite = f"https://discord.com/oauth2/authorize?client_id={self.user.id}&permissions=274878286848&scope=bot%20applications.commands"
+        user_invite = f"https://discord.com/oauth2/authorize?client_id={self.user.id}&scope=applications.commands"
+        logger.info("======================================================================")
+        logger.info(f"BOT SERVER INVITE (Non-Admin, View/Send Messages, Embeds & History):")
+        logger.info(f"  👉 {guild_invite}")
+        logger.info(f"USER APP INSTALL LINK (User integration only, cannot be pinged):")
+        logger.info(f"  👉 {user_invite}")
+        logger.info("======================================================================")
+
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+        if self.user and self.user.mentioned_in(message) and not message.mention_everyone:
+            embed = discord.Embed(
+                title=f"🤖 {self.user.name} is Online!",
+                description=(
+                    "I am active in this server! Use my slash commands:\n\n"
+                    "• `/spamraid` — Repeat text with quick action buttons\n"
+                    "• `/embedspam` — Send customizable rich embeds\n"
+                    "• `/say` — Speak as bot without reply link\n"
+                    "• `/stop` — Abort repeating tasks in channel"
+                ),
+                color=0x6F8CFF,
+            )
+            embed.set_footer(text=f"Server Tag: '{ALLOWED_TAG_NAME}' (Guild ID: {ALLOWED_GUILD_ID})")
+            try:
+                await message.reply(embed=embed, mention_author=False)
+            except Exception:
+                pass
+        await self.process_commands(message)
 
 
 bot = RepeaterBot()
@@ -247,15 +279,16 @@ async def run_repeater(
     embed_data: Optional[dict] = None
 ):
     """
-    High-speed, stable message sender.
-    Directly routes to interaction.followup (if user app) or channel.send (if bot is in server).
-    Automatically and gracefully falls back if channel.send lacks permissions.
-    Uses micro-burst intervals (50ms) to deliver maximum speed without jamming the Discord socket.
+    High-speed concurrent message sender.
+    Sends in parallel bursts for maximum throughput, only sleeping between bursts when delay > 0.
+    Falls back from channel.send to interaction.followup automatically on permission errors.
     """
     channel = interaction.channel
     use_channel = can_use_channel_send(interaction) and channel is not None and hasattr(channel, "send")
 
     sent_count = 0
+    # Discord allows ~5 messages per channel per 5s bucket. Burst that many concurrently.
+    BURST_SIZE = 5
 
     def build_embed():
         if embed_data is None:
@@ -274,59 +307,76 @@ async def run_repeater(
             emb.set_thumbnail(url=embed_data["thumbnail_url"])
         return emb
 
+    async def send_one():
+        """Send a single message with retry logic. Returns True on success."""
+        nonlocal use_channel
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                emb = build_embed()
+                if use_channel:
+                    try:
+                        await channel.send(content=content, embed=emb)
+                        return True
+                    except (discord.Forbidden, discord.HTTPException) as chan_err:
+                        is_missing_access = (
+                            isinstance(chan_err, discord.Forbidden)
+                            or getattr(chan_err, "status", None) == 403
+                            or getattr(chan_err, "code", None) == 50001
+                        )
+                        if is_missing_access:
+                            logger.info("channel.send lacking server access (50001). Switching to interaction.followup.")
+                            use_channel = False
+                            await interaction.followup.send(content=content, embed=emb, ephemeral=False)
+                            return True
+                        raise
+                else:
+                    await interaction.followup.send(content=content, embed=emb, ephemeral=False)
+                    return True
+
+            except discord.RateLimited as rl:
+                wait_time = float(rl.retry_after or 0.5)
+                logger.warning(f"Rate limited (bucket). Sleeping {wait_time:.2f}s...")
+                await asyncio.sleep(wait_time)
+
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = float(getattr(e, "retry_after", 0.5) or 0.5)
+                    logger.warning(f"429 rate limit. Sleeping {retry_after:.2f}s...")
+                    await asyncio.sleep(retry_after)
+                elif "followup" in e.text.lower() or e.code == 50058 or (e.status in (400, 403) and "maximum" in e.text.lower()):
+                    logger.warning(f"Followup token limit reached.")
+                    return False
+                else:
+                    if attempt == max_retries - 1:
+                        logger.error(f"Failed to send message: {e}")
+                        return False
+                    await asyncio.sleep(0.1)
+        return False
+
     try:
-        sleep_interval = max(delay, 0.05) if delay <= 0 else delay
-
-        for i in range(1, amount + 1):
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    emb = build_embed()
-                    if use_channel:
-                        try:
-                            await channel.send(content=content, embed=emb)
-                            sent_count += 1
-                            break
-                        except (discord.Forbidden, discord.HTTPException) as chan_err:
-                            # If Missing Access (50001) or 403 Forbidden, immediately switch to interaction.followup
-                            is_missing_access = (
-                                isinstance(chan_err, discord.Forbidden)
-                                or getattr(chan_err, "status", None) == 403
-                                or getattr(chan_err, "code", None) == 50001
-                            )
-                            if is_missing_access:
-                                logger.info("channel.send lacking server access (50001). Switching to interaction.followup.")
-                                use_channel = False
-                                await interaction.followup.send(content=content, embed=emb, ephemeral=False)
-                                sent_count += 1
-                                break
-                            raise
-                    else:
-                        await interaction.followup.send(content=content, embed=emb, ephemeral=False)
+        remaining = amount
+        while remaining > 0:
+            if delay > 0:
+                # Respect user-set delay: send one at a time with the delay between each
+                ok = await send_one()
+                if ok:
+                    sent_count += 1
+                else:
+                    break
+                remaining -= 1
+                if remaining > 0:
+                    await asyncio.sleep(delay)
+            else:
+                # Zero delay: fire concurrent bursts for maximum speed
+                burst = min(BURST_SIZE, remaining)
+                results = await asyncio.gather(*(send_one() for _ in range(burst)), return_exceptions=True)
+                for r in results:
+                    if r is True:
                         sent_count += 1
-                        break
-
-                except discord.RateLimited as rl:
-                    wait_time = float(rl.retry_after or 0.5)
-                    logger.warning(f"Rate limited (bucket). Sleeping {wait_time:.2f}s...")
-                    await asyncio.sleep(wait_time)
-
-                except discord.HTTPException as e:
-                    if e.status == 429:
-                        retry_after = float(getattr(e, "retry_after", 0.5) or 0.5)
-                        logger.warning(f"429 rate limit on item #{i}. Sleeping {retry_after:.2f}s...")
-                        await asyncio.sleep(retry_after)
-                    elif "followup" in e.text.lower() or e.code == 50058 or (e.status in (400, 403) and "maximum" in e.text.lower()):
-                        logger.warning(f"Followup token limit reached after {sent_count} messages.")
-                        return
-                    else:
-                        if attempt == max_retries - 1:
-                            logger.error(f"Failed to send item #{i}: {e}")
-                            return
-                        await asyncio.sleep(0.3)
-
-            if i < amount:
-                await asyncio.sleep(sleep_interval)
+                    elif isinstance(r, asyncio.CancelledError):
+                        raise r
+                remaining -= burst
 
         logger.info(f"✅ Successfully finished sending {sent_count}/{amount} items for session {session_key}.")
     except asyncio.CancelledError:
@@ -393,18 +443,10 @@ class SpamRaidControlView(discord.ui.View):
             self.add_item(PreMadeMessageSelect())
 
     async def interaction_check(self, button_interaction: discord.Interaction) -> bool:
+        # Only check ownership here — tag check already handled by global tree.interaction_check
         if button_interaction.user.id != self.author_id:
             await button_interaction.response.send_message(
                 "❌ Only the user who executed this command can use these buttons.",
-                ephemeral=True
-            )
-            return False
-
-        has_access, reason = await check_user_server_tag(button_interaction.user)
-        if not has_access:
-            await button_interaction.response.send_message(
-                f"⛔ **Access Denied: Server Tag Required**\n\n"
-                f"You must wear the Server Tag of Guild `{ALLOWED_GUILD_ID}` to use this.",
                 ephemeral=True
             )
             return False

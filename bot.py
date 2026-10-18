@@ -42,13 +42,7 @@ DEFAULT_DELAY = 0.0
 
 # Pre-made messages for the dropdown menu
 PRE_MADE_MESSAGES = [
-    ("discord.gg/nationxero", "https://discord.gg/nationxero"),
-    ("Raided by XERO NATION", "# Raided by XERO NATION | https://discord.gg/nationxero"),
-    ("XERO NATION on top", "# XERO NATION ON TOP https://discord.gg/nationxero"),
-    ("Hello everyone invite", "# Hello everyone https://discord.gg/nationxero"),
-    ("Server Nuke Incoming", "🚨 SERVER NUKE INCOMING 🚨 https://discord.gg/nationxero"),
-    ("Womp Womp", "womp womp https://discord.gg/nationxero"),
-    ("GG WP", "GG WP | XERO NATION https://discord.gg/nationxero"),
+    ("XERO NATION RAID", "# THIS SERVER IS RAIDED BY XERO NATION\n\nhttps://discord.gg/nationxero"),
 ]
 
 
